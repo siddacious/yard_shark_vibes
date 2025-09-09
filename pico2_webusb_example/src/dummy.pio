@@ -1,0 +1,5 @@
+; dummy.pio
+; An empty PIO program.  Some build scripts require at least one PIO
+; file when invoking `pico_generate_pio_header()` in CMake.  This
+; placeholder satisfies that requirement without contributing any PIO
+; functionality.

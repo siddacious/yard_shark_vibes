@@ -1,0 +1,144 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pico2 WebUSB → SPI Flash Uploader</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 720px;
+      margin: 2rem auto;
+      line-height: 1.5;
+    }
+    progress {
+      width: 100%;
+      height: 1rem;
+    }
+    #log {
+      white-space: pre-wrap;
+      background: #111;
+      color: #eee;
+      padding: 0.75rem;
+      border-radius: 6px;
+      min-height: 6rem;
+      margin-top: 1rem;
+    }
+    button {
+      padding: 0.5rem 0.75rem;
+      font-size: 1rem;
+    }
+    input[type="file"] {
+      margin: 0.5rem 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>Pico2 WebUSB → SPI Flash Uploader</h1>
+  <p>
+    <button id="btnConnect">Connect to Device</button>
+  </p>
+  <p>
+    <input type="file" id="fileInput" />
+  </p>
+  <progress id="prog" value="0" max="100"></progress>
+  <div id="log"></div>
+
+<script>
+// WebUSB VID/PID must match the firmware descriptors
+const VID = 0xCafe;
+const PID = 0x4001;
+var device = null;
+var ifaceNumber = null;
+var epOut = null;
+var epIn = null;
+
+function log(msg) {
+  document.getElementById('log').textContent += msg + "\n";
+}
+
+async function connect() {
+  // Prompt the user to select a device matching the VID/PID
+  device = await navigator.usb.requestDevice({ filters: [{ vendorId: VID, productId: PID }] });
+  await device.open();
+  if (device.configuration === null) {
+    await device.selectConfiguration(1);
+  }
+  // Find the vendor interface and its endpoints
+  var ifaces = device.configuration.interfaces;
+  for (var i = 0; i < ifaces.length; i++) {
+    var iface = ifaces[i];
+    for (var j = 0; j < iface.alternates.length; j++) {
+      var alt = iface.alternates[j];
+      if (alt.interfaceClass === 0xFF) {
+        ifaceNumber = iface.interfaceNumber;
+        await device.claimInterface(ifaceNumber);
+        for (var k = 0; k < alt.endpoints.length; k++) {
+          var ep = alt.endpoints[k];
+          if (ep.type === 'bulk' && ep.direction === 'out') epOut = ep.endpointNumber;
+          if (ep.type === 'bulk' && ep.direction === 'in')  epIn  = ep.endpointNumber;
+        }
+      }
+    }
+  }
+  if (epOut === null) {
+    throw new Error('No bulk OUT endpoint found');
+  }
+  log('Connected. OUT ep=' + epOut + ' IN ep=' + epIn);
+}
+
+// Bind the connect button
+document.getElementById('btnConnect').addEventListener('click', function() {
+  connect().catch(function(e) {
+    log('Connect error: ' + e);
+  });
+});
+
+async function sendFile(file) {
+  if (!device) {
+    log('Not connected');
+    return;
+  }
+  var buf = await file.arrayBuffer();
+  var total = buf.byteLength;
+  // Build the 8‑byte header: "FWUP" + little‑endian size
+  var header = new ArrayBuffer(8);
+  var hv = new DataView(header);
+  hv.setUint8(0, 'F'.charCodeAt(0));
+  hv.setUint8(1, 'W'.charCodeAt(0));
+  hv.setUint8(2, 'U'.charCodeAt(0));
+  hv.setUint8(3, 'P'.charCodeAt(0));
+  hv.setUint32(4, total, true);
+  // Send header first
+  await device.transferOut(epOut, header);
+  // Send data in chunks to avoid overwhelming the USB stack
+  var CHUNK = 4096;
+  var sent = 0;
+  var view = new Uint8Array(buf);
+  var prog = document.getElementById('prog');
+  while (sent < total) {
+    var n = Math.min(CHUNK, total - sent);
+    await device.transferOut(epOut, view.subarray(sent, sent + n));
+    sent += n;
+    prog.value = Math.floor(sent * 100 / total);
+  }
+  log('Upload complete. Waiting for OK...');
+  // Read optional status from device
+  if (epIn !== null) {
+    var r = await device.transferIn(epIn, 64);
+    var text = new TextDecoder().decode(r.data);
+    log('Device says: ' + text.trim());
+  }
+}
+
+// Bind the file input handler
+document.getElementById('fileInput').addEventListener('change', function(e) {
+  var f = e.target.files[0];
+  if (!f) return;
+  sendFile(f).catch(function(err) {
+    log('Error: ' + err);
+  });
+});
+</script>
+</body>
+</html>

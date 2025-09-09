@@ -1,0 +1,109 @@
+name: Build Pico2 UF2
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Export the PICO SDK path and build directory for re-use in subsequent steps
+    env:
+      PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
+      BUILD_DIR: pico2_webusb_example/build
+
+    steps:
+      # Check out the repository containing your firmware source
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # Fetch the pico-sdk and its submodules (TinyUSB, pico-extras, etc.).
+      - name: Checkout pico-sdk (with TinyUSB)
+        uses: actions/checkout@v4
+        with:
+          repository: raspberrypi/pico-sdk
+          path: pico-sdk
+          submodules: recursive
+          fetch-depth: 1
+
+      # Cache the pico-sdk to speed up subsequent runs.  The key is based on
+      # the state of all submodule HEADs in the SDK.  If any submodule
+      # changes, the cache will be invalidated.
+      - name: Cache pico-sdk
+        uses: actions/cache@v4
+        with:
+          path: pico-sdk
+          key: pico-sdk-${{ hashFiles('pico-sdk/.git/modules/*/HEAD') }}
+          restore-keys: |
+            pico-sdk-
+
+      # Install the ARM GCC toolchain and CMake.  This uses the host
+      # package manager on Ubuntu.  If you need a different version of
+      # gcc-arm-none-eabi, pin the package or install from another source.
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential gcc-arm-none-eabi libnewlib-arm-none-eabi
+
+      # Configure the CMake build.  We point -S to the Pico project
+      # directory and use BUILD_DIR as our build output location.  The
+      # PICO_SDK_PATH is provided via the environment.
+      - name: Configure project
+        run: |
+          cmake -S pico2_webusb_example -B "${BUILD_DIR}" \
+            -DPICO_BOARD=pico2 \
+            -DPICO_SDK_PATH="${PICO_SDK_PATH}"
+
+      # Build the project.  The --parallel flag uses all available
+      # cores on the build machine to speed up the compile.
+      - name: Build
+        run: cmake --build "${BUILD_DIR}" --parallel
+
+      # Gather output files (.uf2, .elf, .map) and write them to the
+      # GitHub Actions output variables.  Also include a summary in
+      # the job output so you can see what was produced without
+      # downloading artifacts.
+      - name: Collect artifacts
+        id: collect
+        run: |
+          UF2=$(ls ${BUILD_DIR}/*.uf2 | head -n1 || true)
+          ELF=$(ls ${BUILD_DIR}/*.elf | head -n1 || true)
+          MAP=$(ls ${BUILD_DIR}/*.map | head -n1 || true)
+          echo "uf2=$UF2" >> $GITHUB_OUTPUT
+          echo "elf=$ELF" >> $GITHUB_OUTPUT
+          echo "map=$MAP" >> $GITHUB_OUTPUT
+          echo "## Build outputs" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$UF2" ]; then echo "- UF2: \`${UF2}\`" >> $GITHUB_STEP_SUMMARY; fi
+          if [ -n "$ELF" ]; then echo "- ELF: \`${ELF}\`" >> $GITHUB_STEP_SUMMARY; fi
+          if [ -n "$MAP" ]; then echo "- MAP: \`${MAP}\`" >> $GITHUB_STEP_SUMMARY; fi
+
+      # Upload the UF2 file as a build artifact.  The artifact name
+      # includes the short commit SHA so that multiple runs can be
+      # distinguished.  Artifacts are retained for two weeks.
+      - name: Upload UF2
+        if: steps.collect.outputs.uf2 != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico2-uf2-${{ github.sha }}
+          path: ${{ steps.collect.outputs.uf2 }}
+          retention-days: 14
+
+      # Upload ELF and MAP files for debugging.  These are useful for
+      # symbol lookup and analysis.  They are uploaded under a
+      # separate artifact name.
+      - name: Upload ELF and MAP
+        if: steps.collect.outputs.elf != '' || steps.collect.outputs.map != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico2-debug-${{ github.sha }}
+          path: |
+            ${{ steps.collect.outputs.elf }}
+            ${{ steps.collect.outputs.map }}
+          retention-days: 14
