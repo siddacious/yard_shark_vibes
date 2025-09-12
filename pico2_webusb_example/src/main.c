@@ -205,6 +205,7 @@ static void handle_vendor_out(void) {
       const char ok[] = "OK";
       tud_vendor_write_str(ok);
       tud_vendor_flush();
+      reset_session();
     }
   }
 }
