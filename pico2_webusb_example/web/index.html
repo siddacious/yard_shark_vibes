@@ -110,7 +110,9 @@ async function sendFile(file) {
   hv.setUint8(3, 'P'.charCodeAt(0));
   hv.setUint32(4, total, true);
   // Send header first
+  log("Sending Magic Header to erase");
   await device.transferOut(epOut, header);
+  log("Sent! Erase complete, starting write")
   // Send data in chunks to avoid overwhelming the USB stack
   var CHUNK = 4096;
   var sent = 0;
@@ -120,8 +122,9 @@ async function sendFile(file) {
     var n = Math.min(CHUNK, total - sent);
     const result = await device.transferOut(epOut, view.subarray(sent, sent + n));
     log("status is "+result.status);
-    log("Sent "+ result.bytesWritten);
-    sent += n;
+    if(result.status == "ok"){
+      sent += result.bytesWritten;
+    }
     prog.value = Math.floor(sent * 100 / total);
   }
   log('Upload complete. Waiting for OK...');
