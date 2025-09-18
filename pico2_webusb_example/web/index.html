@@ -118,7 +118,9 @@ async function sendFile(file) {
   var prog = document.getElementById('prog');
   while (sent < total) {
     var n = Math.min(CHUNK, total - sent);
-    await device.transferOut(epOut, view.subarray(sent, sent + n));
+    const result = await device.transferOut(epOut, view.subarray(sent, sent + n));
+    log("status is "+result.status);
+    log("Sent "+ result.bytesWritten);
     sent += n;
     prog.value = Math.floor(sent * 100 / total);
   }
