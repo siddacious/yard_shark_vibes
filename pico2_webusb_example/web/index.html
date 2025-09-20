@@ -121,7 +121,6 @@ async function sendFile(file) {
   while (sent < total) {
     var n = Math.min(CHUNK, total - sent);
     const result = await device.transferOut(epOut, view.subarray(sent, sent + n));
-    log("status is "+result.status);
     if(result.status == "ok"){
       sent += result.bytesWritten;
     }

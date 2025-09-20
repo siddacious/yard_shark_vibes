@@ -22,7 +22,7 @@
 // GP2/GP3/GP4 with CS on GP5.  The baud rate of 10 MHz is a safe
 // starting point for most 3.3 V SPI NOR flash devices.
 #define FLASH_SPI             spi0
-#define FLASH_BAUD            (10 * 1000 * 1000)  // 10 MHz
+#define FLASH_BAUD            (25 * 1000 * 1000)  // 10 MHz
 #define PIN_SPI_SCK           2
 #define PIN_SPI_MOSI          3
 #define PIN_SPI_MISO          4
@@ -45,11 +45,23 @@
 // characters followed by a 32‑bit little‑endian total size.
 static const uint8_t PROTO_MAGIC[4] = {'F','W','U','P'};
 
+
+
+// #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 // Global state for the current upload session
 static uint32_t expected_total = 0;
 static uint32_t received_total = 0;
-static uint32_t write_addr = 0;
-static bool header_received = false;
+static uint32_t write_addr      = 0;
+static bool header_received     = false;
+static uint8_t last_percent_sent = 0;
+
+// Send a status string to the host and flush
+#define STATUS_MSG(msg) do { \
+  if (tud_vendor_mounted()) { \
+    tud_vendor_write_str(msg); \
+    tud_vendor_flush(); \
+  } \
+} while (0)
 
 // Helper to assert the chip select line
 static inline void cs_low(void)  { gpio_put(PIN_FLASH_CS, 0); }
@@ -134,14 +146,30 @@ static void flash_page_program(uint32_t addr, const uint8_t *data, uint32_t len)
   flash_wait_busy();
 }
 
-// Erase enough 4 KiB sectors to cover the range [start, start + size).
+
+// Erase enough 4 KiB sectors; send periodic progress
 static void erase_range_4k_aligned(uint32_t start, uint32_t size) {
   uint32_t a0 = start & ~(SECTOR_SIZE - 1);
   uint32_t a1 = (start + size + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
+  uint32_t sector_index = 0;
+  uint32_t total_sectors = (a1 > a0) ? (a1 - a0) / SECTOR_SIZE : 0;
+
   for (uint32_t a = a0; a < a1; a += SECTOR_SIZE) {
     flash_sector_erase(a);
+    sector_index++;
+    tud_task(); /* keep USB stack alive */
+    if (total_sectors) {
+      uint32_t pct = (sector_index * 100U) / total_sectors;
+      if (pct >= last_percent_sent + 10 && pct <= 90) {
+        char msg[32];
+        snprintf(msg, sizeof msg, "ERASE_PROGRESS %lu", (unsigned long)pct);
+        STATUS_MSG(msg);
+        last_percent_sent = pct;
+      }
+    }
   }
 }
+
 
 // Program a sequence of bytes, taking care not to cross page
 // boundaries.  write_addr is updated globally.
@@ -165,46 +193,59 @@ static void reset_session(void) {
   header_received = false;
 }
 
+
 // Handle incoming bulk data.  This is called repeatedly from the
 // TinyUSB task.  It reads available bytes from the vendor OUT
 // endpoint, interprets the first packet as a header, then programs
 // subsequent data into flash.
+
+// Handle the vendor OUT endpoint
 static void handle_vendor_out(void) {
   uint8_t tmp[4096];
   while (tud_vendor_available()) {
-    uint32_t n = tud_vendor_read(tmp, sizeof(tmp));
+    uint32_t n = tud_vendor_read(tmp, sizeof tmp);
     if (!header_received) {
-      // Require at least 8 bytes for the magic + length
-      if (n < 8) {
-        reset_session();
-        return;
+      /* parse header */
+      if (n < 8 || memcmp(tmp, PROTO_MAGIC, 4)) { reset_session(); return; }
+      expected_total = (uint32_t)tmp[4] | ((uint32_t)tmp[5] << 8) |
+                       ((uint32_t)tmp[6] << 16) | ((uint32_t)tmp[7] << 24);
+      /* announce header and erase */
+      {
+        char msg[40];
+        snprintf(msg, sizeof msg, "HEADER_OK %lu", (unsigned long)expected_total);
+        STATUS_MSG(msg);
       }
-      if (memcmp(tmp, PROTO_MAGIC, 4) != 0) {
-        reset_session();
-        return;
-      }
-      expected_total = ((uint32_t)tmp[4]) |
-                       ((uint32_t)tmp[5] << 8) |
-                       ((uint32_t)tmp[6] << 16) |
-                       ((uint32_t)tmp[7] << 24);
-      // Erase the flash area
+      STATUS_MSG("ERASE_START");
       erase_range_4k_aligned(0, expected_total);
+      STATUS_MSG("ERASE_DONE");
       header_received = true;
-      // Process any remaining payload in this first packet
+      /* handle any payload in this first packet */
       uint32_t remain = n - 8;
       if (remain) {
         program_stream(tmp + 8, remain);
         received_total += remain;
+        uint8_t pct = (uint8_t)((received_total * 100U) / expected_total);
+        if (pct > last_percent_sent) {
+          char msg[32];
+          snprintf(msg, sizeof msg, "PROGRESS %u", pct);
+          STATUS_MSG(msg);
+          last_percent_sent = pct;
+        }
       }
     } else {
       program_stream(tmp, n);
       received_total += n;
+      uint8_t pct = (uint8_t)((received_total * 100U) / expected_total);
+      if (pct > last_percent_sent) {
+        char msg[32];
+        snprintf(msg, sizeof msg, "PROGRESS %u", pct);
+        STATUS_MSG(msg);
+        last_percent_sent = pct;
+      }
     }
-    // If we've received all expected bytes, send an "OK" back
-    if (received_total >= expected_total && expected_total != 0) {
-      const char ok[] = "OK";
-      tud_vendor_write_str(ok);
-      tud_vendor_flush();
+    /* final OK and reset */
+    if (expected_total && received_total >= expected_total) {
+      STATUS_MSG("OK");
       reset_session();
     }
   }
@@ -214,15 +255,18 @@ int main(void) {
   // Initialise standard I/O (for optional debug) and the SPI flash
   stdio_init_all();
   flash_spi_init();
+  printf("main() start\n");
 
   // Read the JEDEC ID for informational purposes.  If you have a
   // console connected via CDC, you can print id[0..2] here to check
   // that your flash is talking.
   uint8_t id[3] = {0};
   flash_read_jedec(id);
+  printf("Read JEDEC ID 0x%X%X%X\n", id);
 
   // Initialise TinyUSB device layer
   tusb_init();
+  printf("TinyUSB Init\n");
 
   while (true) {
     // TinyUSB device task
