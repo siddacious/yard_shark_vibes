@@ -100,7 +100,6 @@ def get_endpoints(
         )
     return out_ep, in_ep
 
-
 def read_status(
     in_ep: usb.core.Endpoint, timeout: int, suppress_exceptions: bool = True
 ) -> Optional[str]:
@@ -120,10 +119,10 @@ def read_status(
         msg = bytes(data).decode("utf-8", errors="ignore").strip()
         return msg or None
     except usb.core.USBError as exc:
-        # Timeout errors are common if the device hasn't sent anything.
+            # Timeout errors are common if the device hasn't sent anything.
         if suppress_exceptions and exc.errno is None:
             return None
-        if suppress_exceptions and exc.errno == 110:  # Operation timed out
+        if suppress_exceptions and exc.errno in [110, 60]:  # Operation timed out
             return None
         # Unexpected error: re‑raise
         raise
@@ -134,6 +133,23 @@ def end_index(buffer: str, target: str) -> int:
     target_rindex = buffer.rindex(target)
 
     return (target_rindex, target_rindex + len(target))
+
+def wait_for_status(status_buffer: str, target_string: str, in_ep: usb.core.Endpoint, timeout: int, delay: float = 0.1) -> str:
+    print(f'-------------------------- Checking for {target_string} -------------------------- ')
+    
+    while target_string not in status_buffer:
+        status = read_status(in_ep, timeout)
+        if status:
+            status_buffer += status
+            continue
+        else:
+            time.sleep(delay)
+    print(f"SB:{status_buffer}\n")
+    target_slice_start, target_slice_end = end_index(status_buffer, target_string)
+    status_buffer = status_buffer[target_slice_end:]
+    print(f"SB:{status_buffer}\n")
+
+    print(f'-------------------------- {target_string} → NEXT? -------------------------- ')
 
 def upload_file(
     dev: usb.core.Device,
@@ -179,6 +195,10 @@ def upload_file(
         print(f"→ Waiting {wait_after_header:.1f}s for device to prepare…")
         time.sleep(wait_after_header)
 
+    # once waiting for the erase works we can refactor this to use the wait_for_status function
+    print('-------------------------- Checking for HEADER_OK -------------------------- ')
+
+
     target_string = f"HEADER_OK {total_len}"
     
     while target_string not in status_buffer:
@@ -188,18 +208,19 @@ def upload_file(
             continue
         else:
             sleep(0.1)
-    print(f"\nSB:{status_buffer}")
     target_slice_start, target_slice_end = end_index(status_buffer, target_string)
-    print(f"{status_buffer[target_slice_start:target_slice_end]}")
     status_buffer = status_buffer[target_slice_end:]
     print(f"SB:{status_buffer}\n")
 
+    print('-------------------------- HEADER_OK → ERASE_START -------------------------- ')
 
     # Read any immediate status (e.g. device acknowledging erase)
     print("→ Reading status…", end=" ")
-    status = read_status(in_ep, timeout)
-    if status:
-        print(f"{status}")
+
+    wait_for_status(status_buffer, "ERASE_START", in_ep, timeout)
+    print("Erase Started...")
+    wait_for_status(status_buffer, "ERASE_DONE", in_ep, timeout)
+    print("Erase Done...")
 
 
 
@@ -211,27 +232,19 @@ def upload_file(
         chunk = data[bytes_sent : bytes_sent + chunk_size]
         bytes_sent += out_ep.write(chunk, timeout)
         # Progress output
-        print(f"bytes_sent: {bytes_sent}/{total_len}\n")
-        percent = int(bytes_sent * 100 / total_len)
-        if percent != last_percent:
-            sys.stdout.write(f"\r→ Progress: {percent}%")
-            sys.stdout.flush()
-            last_percent = percent
+        # percent = int(bytes_sent * 100 / total_len)
+        # if percent != last_percent:
+        #     sys.stdout.write(f"\r→ Progress: {percent}%")
+        #     sys.stdout.flush()
+        #     last_percent = percent
         # Read intermediate status messages, if any
         try:
-            status = read_status(in_ep, timeout, suppress_exceptions=True)
+            status = read_status(in_ep, 5, suppress_exceptions=True)
         except usb.core.USBError as e:
-            print(f"Nothing more to read: {e}")
+            pass
         if status:
-            print(f"\n{status}\n") # Called 3 times
-            x = """
-            Device: ERASE_STARTERASE_PROGRESS 10ERASE_PROGRESS 20ERASE_PROGRESS 30ER
+            print(f"{status}") # Called 3 times
 
-            Device: ASE_PROGRESS 40ERASE_PROGRESS 50ERASE_PROGRESS 60ERASE_PROGRESS
-
-            Device: 70ERASE_PROGRESS 80ERASE_PROGRESS 90ERASE_DONE
-            """
-            print(x)
     print("")
 
     # Wait for final status
